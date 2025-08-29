@@ -1,0 +1,89 @@
+name: Deepseek Rota Planner
+
+on:
+  repository_dispatch:
+    types: [rota-plan]   # GAS will fire this
+  workflow_dispatch:      # optional manual trigger for testing
+
+jobs:
+  run-deepseek:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Ensure jq & openssl are available
+        run: |
+          jq --version
+          openssl version
+
+      - name: Build Deepseek request body
+        env:
+          SYSTEM_TEXT: ${{ github.event.client_payload.system_text }}
+          PAYLOAD_INLINE: ${{ github.event.client_payload.payload_inline }}
+        run: |
+          # Build request body with system + user messages
+          jq -n \
+            --arg sys "$SYSTEM_TEXT" \
+            --arg usr "$PAYLOAD_INLINE" \
+            '{ model: "deepseek-reasoner",
+               messages: [ {role:"system", content:$sys}, {role:"user", content:$usr} ],
+               temperature: 0.3 }' > request.json
+          cat request.json
+
+      - name: Call Deepseek API
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          set -euo pipefail
+          curl -sS -X POST "https://api.deepseek.com/v1/chat/completions" \
+            -H "Authorization: Bearer ${DEEPSEEK_API_KEY}" \
+            -H "Content-Type: application/json" \
+            --data-binary @request.json > result.json
+          cat result.json
+
+      - name: Extract model output
+        id: extract
+        run: |
+          CONTENT=$(jq -r '.choices[0].message.content // ""' result.json)
+          jq -n --arg t "$CONTENT" '$t' > text.json
+          cat text.json
+
+      - name: Build callback body
+        env:
+          REQUEST_ID: ${{ github.event.client_payload.request_id }}
+          SHEET_NAME: ${{ github.event.client_payload.meta.sheetName }}
+          SITE: ${{ github.event.client_payload.meta.site }}
+          WARD: ${{ github.event.client_payload.meta.ward }}
+          GH_RUN_ID: ${{ github.run_id }}
+        run: |
+          jq -n \
+            --slurpfile text text.json \
+            --arg req "$REQUEST_ID" \
+            --arg sheet "$SHEET_NAME" \
+            --arg site "$SITE" \
+            --arg ward "$WARD" \
+            --arg gh "$GH_RUN_ID" \
+            '{
+              request_id: $req,
+              status: "ok",
+              text: $text[0],
+              meta: { sheetName: $sheet, site: $site, ward: $ward, gh_run_id: $gh }
+            }' > callback.json
+          cat callback.json
+
+      - name: Sign and POST callback to Apps Script
+        env:
+          CALLBACK_URL: ${{ secrets.CALLBACK_URL }}
+          CALLBACK_HMAC_KEY: ${{ secrets.CALLBACK_HMAC_KEY }}
+          RUN_ID: ${{ github.event.client_payload.request_id }}
+        run: |
+          SIG=$(openssl dgst -sha256 -hmac "${CALLBACK_HMAC_KEY}" -binary callback.json | xxd -p -c 256)
+          curl -sS -X POST "${CALLBACK_URL}" \
+            -H "Content-Type: application/json" \
+            -H "X-RunId: ${RUN_ID}" \
+            -H "X-Signature: ${SIG}" \
+            --data-binary @callback.json -o /dev/stderr -w "\nCallback HTTP %{http_code}\n"
