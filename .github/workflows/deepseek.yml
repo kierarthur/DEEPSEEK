@@ -1,4 +1,4 @@
-name: Deepseek Rota Planner
+name: Deepseek Rota Planner (Streaming)
 
 on:
   repository_dispatch:
@@ -15,75 +15,208 @@ jobs:
       - name: Check out repo
         uses: actions/checkout@v4
 
-      - name: Ensure jq & openssl are available
-        run: |
-          jq --version
-          openssl version
+      - name: Set up Node 18 (native fetch + streams)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
 
-      - name: Build Deepseek request body
+      - name: Show dispatch context (debug-lite)
+        run: |
+          echo "RunId: ${{ github.event.client_payload.request_id }}"
+          echo "Sheet: ${{ github.event.client_payload.meta.sheetName }}"
+          echo "Site/Ward: ${{ github.event.client_payload.meta.site }} / ${{ github.event.client_payload.meta.ward }}"
+
+      - name: Create streaming runner
         env:
-          SYSTEM_TEXT: ${{ github.event.client_payload.system_text }}
+          REQUEST_ID:     ${{ github.event.client_payload.request_id }}
+          SYSTEM_TEXT:    ${{ github.event.client_payload.system_text }}
           PAYLOAD_INLINE: ${{ github.event.client_payload.payload_inline }}
+          SHEET_NAME:     ${{ github.event.client_payload.meta.sheetName }}
+          SITE:           ${{ github.event.client_payload.meta.site }}
+          WARD:           ${{ github.event.client_payload.meta.ward }}
+          DEEPSEEK_API_KEY:     ${{ secrets.DEEPSEEK_API_KEY }}
+          CALLBACK_URL:         ${{ secrets.CALLBACK_URL }}
+          CALLBACK_HMAC_KEY:    ${{ secrets.CALLBACK_HMAC_KEY }}
         run: |
-          # Build request body with system + user messages
-          jq -n \
-            --arg sys "$SYSTEM_TEXT" \
-            --arg usr "$PAYLOAD_INLINE" \
-            '{ model: "deepseek-reasoner",
-               messages: [ {role:"system", content:$sys}, {role:"user", content:$usr} ],
-               temperature: 0.3 }' > request.json
-          cat request.json
+          cat > run.js << 'EOF'
+          // Streaming runner: Deepseek SSE -> signed deltas -> Apps Script
+          // Assumes Deepseek uses OpenAI-compatible SSE: lines starting with "data: { ... }", end with "data: [DONE]".
+          import crypto from 'node:crypto';
+          import { setTimeout as sleep } from 'node:timers/promises';
 
-      - name: Call Deepseek API
-        env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-        run: |
-          set -euo pipefail
-          curl -sS -X POST "https://api.deepseek.com/v1/chat/completions" \
-            -H "Authorization: Bearer ${DEEPSEEK_API_KEY}" \
-            -H "Content-Type: application/json" \
-            --data-binary @request.json > result.json
-          cat result.json
+          const env = process.env;
+          const RUN_ID  = env.REQUEST_ID;
+          const SYS     = env.SYSTEM_TEXT ?? '';
+          const USR     = env.PAYLOAD_INLINE ?? '';
+          const SHEET   = env.SHEET_NAME ?? '';
+          const SITE    = env.SITE ?? '';
+          const WARD    = env.WARD ?? '';
+          const DS_KEY  = env.DEEPSEEK_API_KEY;
+          const CB_URL  = env.CALLBACK_URL;
+          const HMACKEY = env.CALLBACK_HMAC_KEY;
 
-      - name: Extract model output
-        id: extract
-        run: |
-          CONTENT=$(jq -r '.choices[0].message.content // ""' result.json)
-          jq -n --arg t "$CONTENT" '$t' > text.json
-          cat text.json
+          if (!RUN_ID || !DS_KEY || !CB_URL || !HMACKEY) {
+            console.error('Missing required environment vars.'); process.exit(2);
+          }
 
-      - name: Build callback body
-        env:
-          REQUEST_ID: ${{ github.event.client_payload.request_id }}
-          SHEET_NAME: ${{ github.event.client_payload.meta.sheetName }}
-          SITE: ${{ github.event.client_payload.meta.site }}
-          WARD: ${{ github.event.client_payload.meta.ward }}
-          GH_RUN_ID: ${{ github.run_id }}
-        run: |
-          jq -n \
-            --slurpfile text text.json \
-            --arg req "$REQUEST_ID" \
-            --arg sheet "$SHEET_NAME" \
-            --arg site "$SITE" \
-            --arg ward "$WARD" \
-            --arg gh "$GH_RUN_ID" \
-            '{
-              request_id: $req,
-              status: "ok",
-              text: $text[0],
-              meta: { sheetName: $sheet, site: $site, ward: $ward, gh_run_id: $gh }
-            }' > callback.json
-          cat callback.json
+          // ---- Helpers ----
+          function signBody(body) {
+            const h = crypto.createHmac('sha256', HMACKEY);
+            h.update(body);
+            return h.digest('hex');
+          }
+          async function postToGAS(obj) {
+            const body = JSON.stringify(obj);
+            const sig  = signBody(body);
+            const res  = await fetch(CB_URL, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'X-RunId': RUN_ID,
+                'X-Signature': sig
+              },
+              body
+            });
+            if (!res.ok) {
+              const t = await res.text().catch(()=> '');
+              console.error('Callback HTTP', res.status, t);
+            }
+          }
 
-      - name: Sign and POST callback to Apps Script
-        env:
-          CALLBACK_URL: ${{ secrets.CALLBACK_URL }}
-          CALLBACK_HMAC_KEY: ${{ secrets.CALLBACK_HMAC_KEY }}
-          RUN_ID: ${{ github.event.client_payload.request_id }}
-        run: |
-          SIG=$(openssl dgst -sha256 -hmac "${CALLBACK_HMAC_KEY}" -binary callback.json | xxd -p -c 256)
-          curl -sS -X POST "${CALLBACK_URL}" \
-            -H "Content-Type: application/json" \
-            -H "X-RunId: ${RUN_ID}" \
-            -H "X-Signature: ${SIG}" \
-            --data-binary @callback.json -o /dev/stderr -w "\nCallback HTTP %{http_code}\n"
+          async function sendInit() {
+            await postToGAS({
+              request_id: RUN_ID,
+              type: 'init',
+              meta: { sheetName: SHEET, site: SITE, ward: WARD, model: 'deepseek-reasoner' },
+              t0_ms: Date.now()
+            });
+          }
+          async function sendDelta(seq, text_delta) {
+            if (!text_delta) return;
+            await postToGAS({
+              request_id: RUN_ID,
+              type: 'delta',
+              seq,
+              text_delta
+            });
+          }
+          async function sendFinal(status, fullText, stats, errMsg) {
+            const obj = {
+              request_id: RUN_ID,
+              type: 'final',
+              status: status || 'ok',
+              meta: { sheetName: SHEET, site: SITE, ward: WARD },
+              stats: stats || {}
+            };
+            if (fullText != null) obj.text_full = fullText;
+            if (errMsg) obj.error_message = errMsg;
+            await postToGAS(obj);
+          }
+          async function sendError(msg) {
+            await postToGAS({
+              request_id: RUN_ID,
+              type: 'error',
+              error_message: String(msg || 'unknown error')
+            });
+          }
+
+          // ---- Deepseek streaming call ----
+          const API_URL = 'https://api.deepseek.com/v1/chat/completions';
+          const requestBody = {
+            model: 'deepseek-reasoner',             // keep aligned with your GAS code
+            messages: [
+              { role: 'system', content: SYS },
+              { role: 'user',   content: USR }
+            ],
+            temperature: 0.3,
+            stream: true                            // <— enable streaming
+          };
+
+          // Accumulators
+          let buffer = '';          // full text so far
+          let batch  = '';          // batch for next delta
+          let seq    = 0;
+          let lastFlush = Date.now();
+          const FLUSH_MS = 1000;    // throttle: send at most ~1 delta/sec
+          let done = false;
+
+          try {
+            await sendInit();
+
+            const res = await fetch(API_URL, {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${DS_KEY}`,
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify(requestBody)
+            });
+
+            if (!res.ok || !res.body) {
+              const txt = await res.text().catch(()=> '');
+              throw new Error(`Deepseek HTTP ${res.status}: ${txt}`);
+            }
+
+            const dec = new TextDecoder();
+            const reader = res.body.getReader();
+
+            const flushIfNeeded = async (force = false) => {
+              const now = Date.now();
+              if (force || now - lastFlush >= FLUSH_MS) {
+                if (batch.length > 0) {
+                  seq += 1;
+                  const toSend = batch;
+                  batch = '';
+                  lastFlush = now;
+                  await sendDelta(seq, toSend);
+                }
+              }
+            };
+
+            while (true) {
+              const { value, done: streamDone } = await reader.read();
+              if (streamDone) break;
+              const chunk = dec.decode(value, { stream: true });
+
+              // Parse SSE frames (lines starting with "data:")
+              const lines = chunk.split(/\r?\n/);
+              for (const line of lines) {
+                const m = line.match(/^data:\s*(.*)\s*$/);
+                if (!m) continue;
+                const payload = m[1];
+                if (payload === '[DONE]') {
+                  done = true;
+                  break;
+                }
+                try {
+                  const obj = JSON.parse(payload);
+                  // OpenAI-like delta path
+                  const piece = obj?.choices?.[0]?.delta?.content ?? '';
+                  if (piece) {
+                    buffer += piece;
+                    batch  += piece;
+                  }
+                } catch { /* ignore parse errors from keep-alives */ }
+              }
+
+              await flushIfNeeded(false);
+            }
+
+            // Final flush
+            await flushIfNeeded(true);
+            await sendFinal('ok', buffer, { duration_ms: 0 });
+          } catch (err) {
+            console.error('Streaming error:', err);
+            // Best-effort final: send partial buffer + error
+            try {
+              await sendFinal('error', buffer, { }, String(err && err.message || err));
+            } catch { /* swallow */ }
+            // Also send explicit error event for UI clarity
+            try {
+              await sendError(String(err && err.message || err));
+            } catch { /* swallow */ }
+            process.exit(1);
+          }
+          EOF
+
+          node run.js
