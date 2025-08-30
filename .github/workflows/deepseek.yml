@@ -2,8 +2,8 @@ name: Deepseek Rota Planner (Streaming)
 
 on:
   repository_dispatch:
-    types: [rota-plan]   # GAS will fire this
-  workflow_dispatch:      # optional manual trigger for testing
+    types: [rota-plan]
+  workflow_dispatch:
 
 jobs:
   run-deepseek:
@@ -39,9 +39,8 @@ jobs:
           CALLBACK_HMAC_KEY:    ${{ secrets.CALLBACK_HMAC_KEY }}
         run: |
           cat > run.js << 'EOF'
-          // Streaming runner: Deepseek SSE -> signed deltas -> Apps Script
-          // Sends HMAC + runId via QUERY PARAMS (?sig=&rid=) to match GAS doPost.
-          import crypto from 'node:crypto';
+          // Streaming runner: Deepseek SSE -> signed deltas -> Apps Script (CommonJS)
+          const crypto = require('node:crypto');
 
           const env = process.env;
           const RUN_ID  = env.REQUEST_ID;
@@ -128,81 +127,83 @@ jobs:
             stream: true
           };
 
-          // Accumulators
-          let buffer = '';
-          let batch  = '';
-          let seq    = 0;
-          let lastFlush = Date.now();
-          const FLUSH_MS = 1000;
+          (async () => {
+            // Accumulators
+            let buffer = '';
+            let batch  = '';
+            let seq    = 0;
+            let lastFlush = Date.now();
+            const FLUSH_MS = 1000;
 
-          try {
-            await sendInit();
+            try {
+              await sendInit();
 
-            const res = await fetch(API_URL, {
-              method: 'POST',
-              headers: {
-                'Authorization': `Bearer ${DS_KEY}`,
-                'Content-Type': 'application/json'
-              },
-              body: JSON.stringify(requestBody)
-            });
+              const res = await fetch(API_URL, {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${DS_KEY}`,
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(requestBody)
+              });
 
-            if (!res.ok || !res.body) {
-              const txt = await res.text().catch(()=> '');
-              throw new Error(`Deepseek HTTP ${res.status}: ${txt}`);
-            }
-
-            const dec = new TextDecoder();
-            const reader = res.body.getReader();
-
-            const flushIfNeeded = async (force = false) => {
-              const now = Date.now();
-              if (force || now - lastFlush >= FLUSH_MS) {
-                if (batch.length > 0) {
-                  seq += 1;
-                  const toSend = batch;
-                  batch = '';
-                  lastFlush = now;
-                  await sendDelta(seq, toSend);
-                }
+              if (!res.ok || !res.body) {
+                const txt = await res.text().catch(()=> '');
+                throw new Error(`Deepseek HTTP ${res.status}: ${txt}`);
               }
-            };
 
-            while (true) {
-              const { value, done: streamDone } = await reader.read();
-              if (streamDone) break;
-              const chunk = dec.decode(value, { stream: true });
+              const dec = new TextDecoder();
+              const reader = res.body.getReader();
 
-              // Parse SSE frames (lines starting with "data:")
-              const lines = chunk.split(/\r?\n/);
-              for (const line of lines) {
-                const m = line.match(/^data:\s*(.*)\s*$/);
-                if (!m) continue;
-                const payload = m[1];
-                if (payload === '[DONE]') {
-                  break;
-                }
-                try {
-                  const obj = JSON.parse(payload);
-                  const piece = obj?.choices?.[0]?.delta?.content ?? '';
-                  if (piece) {
-                    buffer += piece;
-                    batch  += piece;
+              const flushIfNeeded = async (force = false) => {
+                const now = Date.now();
+                if (force || now - lastFlush >= FLUSH_MS) {
+                  if (batch.length > 0) {
+                    seq += 1;
+                    const toSend = batch;
+                    batch = '';
+                    lastFlush = now;
+                    await sendDelta(seq, toSend);
                   }
-                } catch { /* ignore parse errors from keep-alives */ }
+                }
+              };
+
+              while (true) {
+                const { value, done: streamDone } = await reader.read();
+                if (streamDone) break;
+                const chunk = dec.decode(value, { stream: true });
+
+                // Parse SSE frames (lines starting with "data:")
+                const lines = chunk.split(/\r?\n/);
+                for (const line of lines) {
+                  const m = line.match(/^data:\s*(.*)\s*$/);
+                  if (!m) continue;
+                  const payload = m[1];
+                  if (payload === '[DONE]') {
+                    break;
+                  }
+                  try {
+                    const obj = JSON.parse(payload);
+                    const piece = obj?.choices?.[0]?.delta?.content ?? '';
+                    if (piece) {
+                      buffer += piece;
+                      batch  += piece;
+                    }
+                  } catch { /* ignore parse errors from keep-alives */ }
+                }
+
+                await flushIfNeeded(false);
               }
 
-              await flushIfNeeded(false);
+              await flushIfNeeded(true);
+              await sendFinal('ok', buffer, { duration_ms: 0 });
+            } catch (err) {
+              console.error('Streaming error:', err);
+              try { await sendFinal('error', buffer, {}, String(err && err.message || err)); } catch {}
+              try { await sendError(String(err && err.message || err)); } catch {}
+              process.exit(1);
             }
-
-            await flushIfNeeded(true);
-            await sendFinal('ok', buffer, { duration_ms: 0 });
-          } catch (err) {
-            console.error('Streaming error:', err);
-            try { await sendFinal('error', buffer, {}, String(err && err.message || err)); } catch {}
-            try { await sendError(String(err && err.message || err)); } catch {}
-            process.exit(1);
-          }
+          })();
           EOF
 
           node run.js
