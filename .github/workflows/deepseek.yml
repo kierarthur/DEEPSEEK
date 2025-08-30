@@ -28,21 +28,20 @@ jobs:
 
       - name: Create streaming runner
         env:
-          REQUEST_ID:     ${{ github.event.client_payload.request_id }}
-          SYSTEM_TEXT:    ${{ github.event.client_payload.system_text }}
-          PAYLOAD_INLINE: ${{ github.event.client_payload.payload_inline }}
-          SHEET_NAME:     ${{ github.event.client_payload.meta.sheetName }}
-          SITE:           ${{ github.event.client_payload.meta.site }}
-          WARD:           ${{ github.event.client_payload.meta.ward }}
+          REQUEST_ID:           ${{ github.event.client_payload.request_id }}
+          SYSTEM_TEXT:          ${{ github.event.client_payload.system_text }}
+          PAYLOAD_INLINE:       ${{ github.event.client_payload.payload_inline }}
+          SHEET_NAME:           ${{ github.event.client_payload.meta.sheetName }}
+          SITE:                 ${{ github.event.client_payload.meta.site }}
+          WARD:                 ${{ github.event.client_payload.meta.ward }}
           DEEPSEEK_API_KEY:     ${{ secrets.DEEPSEEK_API_KEY }}
           CALLBACK_URL:         ${{ secrets.CALLBACK_URL }}
           CALLBACK_HMAC_KEY:    ${{ secrets.CALLBACK_HMAC_KEY }}
         run: |
           cat > run.js << 'EOF'
           // Streaming runner: Deepseek SSE -> signed deltas -> Apps Script
-          // Assumes Deepseek uses OpenAI-compatible SSE: lines starting with "data: { ... }", end with "data: [DONE]".
+          // Sends HMAC + runId via QUERY PARAMS (?sig=&rid=) to match GAS doPost.
           import crypto from 'node:crypto';
-          import { setTimeout as sleep } from 'node:timers/promises';
 
           const env = process.env;
           const RUN_ID  = env.REQUEST_ID;
@@ -59,7 +58,7 @@ jobs:
             console.error('Missing required environment vars.'); process.exit(2);
           }
 
-          // ---- Helpers ----
+          // ---- Helpers (query-param signature) ----
           function signBody(body) {
             const h = crypto.createHmac('sha256', HMACKEY);
             h.update(body);
@@ -68,13 +67,10 @@ jobs:
           async function postToGAS(obj) {
             const body = JSON.stringify(obj);
             const sig  = signBody(body);
-            const res  = await fetch(CB_URL, {
+            const url  = `${CB_URL}?sig=${encodeURIComponent(sig)}&rid=${encodeURIComponent(RUN_ID)}`;
+            const res  = await fetch(url, {
               method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'X-RunId': RUN_ID,
-                'X-Signature': sig
-              },
+              headers: { 'Content-Type': 'application/json' },
               body
             });
             if (!res.ok) {
@@ -123,22 +119,21 @@ jobs:
           // ---- Deepseek streaming call ----
           const API_URL = 'https://api.deepseek.com/v1/chat/completions';
           const requestBody = {
-            model: 'deepseek-reasoner',             // keep aligned with your GAS code
+            model: 'deepseek-reasoner',
             messages: [
               { role: 'system', content: SYS },
               { role: 'user',   content: USR }
             ],
             temperature: 0.3,
-            stream: true                            // <— enable streaming
+            stream: true
           };
 
           // Accumulators
-          let buffer = '';          // full text so far
-          let batch  = '';          // batch for next delta
+          let buffer = '';
+          let batch  = '';
           let seq    = 0;
           let lastFlush = Date.now();
-          const FLUSH_MS = 1000;    // throttle: send at most ~1 delta/sec
-          let done = false;
+          const FLUSH_MS = 1000;
 
           try {
             await sendInit();
@@ -185,12 +180,10 @@ jobs:
                 if (!m) continue;
                 const payload = m[1];
                 if (payload === '[DONE]') {
-                  done = true;
                   break;
                 }
                 try {
                   const obj = JSON.parse(payload);
-                  // OpenAI-like delta path
                   const piece = obj?.choices?.[0]?.delta?.content ?? '';
                   if (piece) {
                     buffer += piece;
@@ -202,19 +195,12 @@ jobs:
               await flushIfNeeded(false);
             }
 
-            // Final flush
             await flushIfNeeded(true);
             await sendFinal('ok', buffer, { duration_ms: 0 });
           } catch (err) {
             console.error('Streaming error:', err);
-            // Best-effort final: send partial buffer + error
-            try {
-              await sendFinal('error', buffer, { }, String(err && err.message || err));
-            } catch { /* swallow */ }
-            // Also send explicit error event for UI clarity
-            try {
-              await sendError(String(err && err.message || err));
-            } catch { /* swallow */ }
+            try { await sendFinal('error', buffer, {}, String(err && err.message || err)); } catch {}
+            try { await sendError(String(err && err.message || err)); } catch {}
             process.exit(1);
           }
           EOF
