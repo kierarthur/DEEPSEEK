@@ -1,5 +1,6 @@
 import io
 import os
+import logging
 from typing import Optional, Tuple, List
 
 import httpx
@@ -7,15 +8,33 @@ import fitz  # PyMuPDF
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import Response, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, AnyHttpUrl
-from PIL import Image, ImageOps  # <-- ImageOps for EXIF orientation
+from PIL import Image, ImageOps  # ImageOps for EXIF orientation
 from google.cloud import vision
 
+# ---------------------------
+# Versioning / logging
+# ---------------------------
+APP_VERSION = os.getenv("APP_VERSION", "1")
+
+logger = logging.getLogger("headshot_service")
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+# ---------------------------
 # Tunables via env (safe defaults)
+# ---------------------------
 TARGET_WH = float(os.getenv("HEADSHOT_TARGET_WH", "0.78"))  # W:H ~ 35:45
 MARGIN_PCT = float(os.getenv("HEADSHOT_MARGIN_PCT", "0.12"))
 JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "85"))
 
-app = FastAPI(title="Checklist Headshot Service", version="1.0.0")
+app = FastAPI(title="Checklist Headshot Service", version=APP_VERSION)
+
+
+@app.on_event("startup")
+async def _on_startup():
+    logger.info(
+        "Headshot service starting: version=%s target_wh=%.3f margin_pct=%.3f jpeg_quality=%d",
+        APP_VERSION, TARGET_WH, MARGIN_PCT, JPEG_QUALITY
+    )
 
 
 # ---------------------------
@@ -212,11 +231,11 @@ class UrlIn(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "version": APP_VERSION}
 
 @app.get("/", response_class=PlainTextResponse)
 def root():
-    return "Checklist Headshot Service: /health, POST /process (multipart file) or POST /process-url (JSON {url})"
+    return f"Checklist Headshot Service v{APP_VERSION}: /health, POST /process (multipart file) or POST /process-url (JSON {{url}})"
 
 @app.post("/process-url")
 async def process_url(payload: UrlIn):
@@ -229,6 +248,7 @@ async def process_url(payload: UrlIn):
             content_type = r.headers.get("content-type", "")
             data = r.content
     except Exception as e:
+        logger.exception("process-url fetch error (version=%s)", APP_VERSION)
         raise HTTPException(status_code=502, detail=f"Fetch error: {e}")
 
     return await _process_common(data, content_type)
@@ -241,7 +261,10 @@ async def process_file(file: UploadFile = File(...)):
 
 async def _process_common(data: bytes, content_type: str):
     try:
-        if _is_pdf_bytes(data, content_type):
+        is_pdf = _is_pdf_bytes(data, content_type)
+        logger.info("Processing request (version=%s, is_pdf=%s, content_type=%s)", APP_VERSION, is_pdf, content_type)
+
+        if is_pdf:
             img = _pil_from_pdf_first_page(data)
         else:
             img = _pil_from_image_bytes(data)
@@ -253,10 +276,24 @@ async def _process_common(data: bytes, content_type: str):
             cropped = _crop_to_ratio_center(img, target_wh=TARGET_WH)
 
         jpeg = _final_jpeg(cropped, JPEG_QUALITY)
-        return Response(content=jpeg, media_type="image/jpeg",
-                        headers={"Cache-Control": "no-store"})
+        return Response(
+            content=jpeg,
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Headshot-Version": APP_VERSION
+            }
+        )
     except HTTPException:
         raise
     except Exception as e:
+        logger.exception("Processing failed (version=%s)", APP_VERSION)
         # Log-ish detail in JSON, but don’t leak internals
-        return JSONResponse(status_code=500, content={"error": "processing_failed", "detail": str(e)})
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "processing_failed",
+                "detail": str(e),
+                "version": APP_VERSION
+            }
+        )
