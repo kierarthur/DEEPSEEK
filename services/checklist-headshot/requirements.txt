@@ -1,1 +1,6 @@
-flask==3.0.0
+fastapi
+uvicorn[standard]
+pillow
+pymupdf
+google-cloud-vision
+httpx
