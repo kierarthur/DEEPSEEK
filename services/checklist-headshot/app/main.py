@@ -7,7 +7,7 @@ import fitz  # PyMuPDF
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import Response, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, AnyHttpUrl
-from PIL import Image
+from PIL import Image, ImageOps  # <-- ImageOps for EXIF orientation
 from google.cloud import vision
 
 # Tunables via env (safe defaults)
@@ -36,13 +36,22 @@ def _pil_from_pdf_first_page(pdf_bytes: bytes) -> Image.Image:
     # Scale ~200 DPI
     mat = fitz.Matrix(200/72, 200/72)
     pix = page.get_pixmap(matrix=mat, alpha=False)
-    img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+    img = Image.open(io.BytesIO(pix.tobytes("png")))
+    # Apply EXIF orientation (usually none for PDFs) and normalize mode
+    img = ImageOps.exif_transpose(img)
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGB")
+    if img.mode == "RGBA":
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img, mask=img.split()[-1])
+        img = bg
     doc.close()
     return img
 
 def _pil_from_image_bytes(image_bytes: bytes) -> Image.Image:
     img = Image.open(io.BytesIO(image_bytes))
-    # Normalize
+    # Normalize orientation and color
+    img = ImageOps.exif_transpose(img)
     if img.mode not in ("RGB", "RGBA"):
         img = img.convert("RGB")
     if img.mode == "RGBA":
@@ -62,6 +71,7 @@ def _largest_face_box_wxh(image: Image.Image) -> Optional[Tuple[int, int, int, i
     Returns (x, y, w, h) or None
     """
     buf = io.BytesIO()
+    # Save a temporary JPEG (no EXIF needed) for Vision bytes
     image.save(buf, format="JPEG", quality=90)
     content = buf.getvalue()
 
@@ -154,6 +164,15 @@ def _crop_around_face(img: Image.Image, box: Tuple[int, int, int, int], margin_p
 
 
 def _final_jpeg(img: Image.Image, quality: int = JPEG_QUALITY) -> bytes:
+    """
+    Produce a fresh JPEG with:
+    - Square DPI (96x96) to avoid X/Y density mismatch
+    - No EXIF (prevents downstream apps from applying rotations/scales)
+    - Reasonable downscale for bandwidth
+    """
+    # Safety: apply EXIF orientation one more time in case upstream changed it
+    img = ImageOps.exif_transpose(img)
+
     # mildly downscale huge images for “checklist” use (keeps bandwidth down)
     max_side = 1200
     W, H = img.size
@@ -166,8 +185,21 @@ def _final_jpeg(img: Image.Image, quality: int = JPEG_QUALITY) -> bytes:
             new_w = int(W * (new_h / H))
         img = img.resize((new_w, new_h), Image.LANCZOS)
 
+    # ensure RGB
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    # Save with square DPI and no EXIF; optimize for size
+    img.save(
+        buf,
+        format="JPEG",
+        quality=quality,
+        optimize=True,
+        dpi=(96, 96),
+        exif=b"",            # strip EXIF entirely
+        progressive=True
+    )
     return buf.getvalue()
 
 
