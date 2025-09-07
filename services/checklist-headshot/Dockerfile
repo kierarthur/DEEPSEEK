@@ -1,16 +1,27 @@
 FROM python:3.11-slim
 
-WORKDIR /app
+# Fast, predictable Python behavior
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
 
-# Install deps
+# (Optional but helpful) system libs for Pillow JPEG/zlib
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libjpeg62-turbo libjpeg62-turbo-dev zlib1g zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install Python deps first for better layer caching
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy app
+# Copy app code
 COPY app ./app
 
-# Cloud Run provides $PORT
+# Cloud Run injects PORT; default here is just a hint
 ENV PORT=8080
-CMD exec uvicorn app.main:app --host 0.0.0.0 --port $PORT
+EXPOSE 8080
+
+# Start FastAPI via uvicorn
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "${PORT}"]
