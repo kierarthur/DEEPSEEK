@@ -1,17 +1,24 @@
-# Ignore Python cache
+# VCS / tooling
+.git
+.github
+.gitignore
+
+# Python cruft
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
 
-# Ignore Git
-.git
-.gitignore
-
-# Ignore editor settings
-.vscode/
-*.swp
-
-# Ignore local files
+# Envs & IDE
+.venv/
+venv/
 .env
-*.log
-*.DS_Store
+.idea/
+.vscode/
+
+# Tests / docs (not needed in image)
+tests/
+docs/
