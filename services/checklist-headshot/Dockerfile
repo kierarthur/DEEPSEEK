@@ -23,5 +23,5 @@ COPY app ./app
 ENV PORT=8080
 EXPOSE 8080
 
-# Start FastAPI via uvicorn
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "${PORT}"]
+# Start FastAPI via uvicorn (expand $PORT correctly)
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080}"]
