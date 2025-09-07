@@ -1,1 +1,17 @@
+# Ignore Python cache
+__pycache__/
+*.pyc
+*.pyo
 
+# Ignore Git
+.git
+.gitignore
+
+# Ignore editor settings
+.vscode/
+*.swp
+
+# Ignore local files
+.env
+*.log
+*.DS_Store
