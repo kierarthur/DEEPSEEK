@@ -1,19 +1,16 @@
-# Use lightweight Python runtime
 FROM python:3.11-slim
 
-# Set working directory
 WORKDIR /app
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-# Install dependencies
-COPY requirements.txt requirements.txt
+# Install deps
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy app code
-COPY app/ ./app
+# Copy app
+COPY app ./app
 
-# Expose port 8080 (Cloud Run expects this)
+# Cloud Run provides $PORT
 ENV PORT=8080
-
-# Run Flask app
-CMD ["python", "-m", "flask", "--app", "app.main", "run", "--host=0.0.0.0", "--port=8080"]
-
+CMD exec uvicorn app.main:app --host 0.0.0.0 --port $PORT
